@@ -8,7 +8,1579 @@
 :root {
   --bg: #f8f8f6;
   --bg2: #ffffff;
-  --bg3: #f1efea;
+  --bg3: #f1efea;<!DOCTYPE html>
+<html lang="ja">
+<head>
+<!--
+  SLA監視管理コンソール - フロントエンド
+  ========================================
+  概要:
+    Flask APIサーバー (app.py) と通信し、SLA監視の設定・実行・確認を
+    ブラウザ上で完結させるシングルページアプリケーション (SPA)。
+
+  画面構成:
+    ┌──────────┬──────────────────────────────────────┐
+    │ サイドバー │ メインコンテンツ (タブ切替)           │
+    │ ナビ     │ [状態確認] チームSLA一覧テーブル        │
+    │          │ [チーム管理] チーム追加・削除・有効化    │
+    │          │ [監視ターゲット] SLA×チームのIPアドレス │
+    │          │ [スケジュール] crontab設定              │
+    │          │ [データベース] InfluxDB接続・Measurement│
+    │          │ [ログ] 当日の実行ログ表示               │
+    └──────────┴──────────────────────────────────────┘
+
+  状態管理:
+    グローバルな `state` オブジェクトに全設定を保持し、
+    画面描画はすべて state から行う。API レスポンスで state を更新後に再描画する。
+
+  API通信:
+    同一オリジン (Flask が index.html も配信) のため CORS 制限なし。
+    非同期通信は fetch API + async/await で統一。
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SLA管理コンソール</title>
+<style>
+/*
+  ── CSS カスタムプロパティ (デザイントークン) ──
+  ライトモード・ダークモードの両方に対応するため、
+  色は直接指定せず CSS 変数で一元管理する。
+  @media (prefers-color-scheme: dark) でダークモード時に上書きする。
+*/
+:root {
+  --bg: #f8f8f6;            /* ページ背景 */
+  --bg2: #ffffff;           /* カード・サイドバー背景 */
+  --bg3: #f1efea;           /* テーブルヘッダ・入力欄背景 */
+  --border: rgba(0,0,0,0.10);   /* 標準ボーダー（薄め） */
+  --border2: rgba(0,0,0,0.18);  /* 強調ボーダー（入力欄等） */
+  --text: #1a1a18;          /* 主テキスト */
+  --text2: #5f5e5a;         /* 補助テキスト（ラベル・ヒント） */
+  --accent: #178FD4;        /* アクセントカラー（ボタン・リンク） */
+  --accent-bg: #E6F1FB;     /* アクセント薄背景 */
+  --accent-text: #0C447C;   /* アクセント背景上のテキスト */
+  --ok-bg: #EAF3DE; --ok: #3B6D11;     /* 正常状態 */
+  --err-bg: #FCEBEB; --err: #A32D2D;   /* エラー状態 */
+  --warn-bg: #FAEEDA; --warn: #854F0B; /* 警告状態 */
+  --radius: 8px;    /* 標準角丸 */
+  --radius-lg: 12px; /* カード角丸 */
+  --mono: 'Courier New', monospace; /* 等幅フォント（IPアドレス・crontab表示用） */
+}
+
+/* ダークモード: OSの設定に追従して色を上書きする */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#1e1e1c; --bg2:#2a2a28; --bg3:#242422;
+    --border:rgba(255,255,255,.10); --border2:rgba(255,255,255,.20);
+    --text:#f0ede6; --text2:#888780;
+    --accent-bg:#0C2840; --accent-text:#85B7EB;
+    --ok-bg:#173404; --ok:#97C459;
+    --err-bg:#280d0d; --err:#F09595;
+    --warn-bg:#1e1200; --warn:#EF9F27;
+  }
+}
+
+/* 全要素のボックスモデルを border-box に統一（余白計算を直感的にする） */
+*{box-sizing:border-box;margin:0;padding:0;}
+
+/* ページ全体: OS 標準のシステムフォントを使用 */
+body{
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+  font-size:14px;
+  background:var(--bg);
+  color:var(--text);
+  min-height:100vh;
+}
+a{color:var(--accent);}
+
+/* ── レイアウト ──
+   サイドバー (固定幅) + メインコンテンツ (可変幅) の2カラムレイアウト。
+   height: 100vh で画面全体を占有し、内部でスクロールする。 */
+.app{display:flex;height:100vh;overflow:hidden;}
+
+/* サイドバー: 固定幅・縦方向フレックスでナビアイテムを積み重ねる */
+.sidebar{
+  width:200px;
+  flex-shrink:0;          /* ウィンドウを狭めてもサイドバーは縮まない */
+  background:var(--bg2);
+  border-right:0.5px solid var(--border);
+  display:flex;
+  flex-direction:column;
+  padding:16px 0;
+}
+.sidebar-logo{
+  display:flex;align-items:center;gap:8px;
+  padding:0 16px 16px;
+  border-bottom:0.5px solid var(--border);
+  margin-bottom:8px;
+}
+.sidebar-logo svg{color:var(--accent);}
+.sidebar-title{font-weight:600;font-size:13px;}
+
+/* ナビゲーションアイテム: 全幅ボタンとして実装 */
+.nav-item{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 16px;
+  cursor:pointer;font-size:13px;
+  color:var(--text2);
+  border-radius:0;
+  transition:background .12s,color .12s;
+  border:none;background:none;
+  width:100%;text-align:left;
+}
+.nav-item:hover{background:var(--bg3);color:var(--text);}
+/* アクティブタブ: アクセントカラーで強調 */
+.nav-item.active{background:var(--accent-bg);color:var(--accent-text);font-weight:500;}
+.nav-item svg{width:16px;height:16px;flex-shrink:0;}
+
+/* メインエリア: 縦スクロール可能 */
+.main{flex:1;overflow-y:auto;display:flex;flex-direction:column;}
+
+/* トップバー: 現在のページタイトル・操作ボタンを表示する固定ヘッダ */
+.topbar{
+  display:flex;align-items:center;gap:10px;
+  padding:12px 24px;
+  border-bottom:0.5px solid var(--border);
+  background:var(--bg2);
+  flex-shrink:0; /* コンテンツが増えてもトップバーは縮まない */
+}
+.topbar-title{font-size:15px;font-weight:500;flex:1;}
+
+/* コンテンツ領域: タブパネルを表示する */
+.content{padding:24px;flex:1;}
+
+/* ── カードコンポーネント ──
+   設定フォームや情報を枠線付きの白背景ボックスで囲む。 */
+.card{
+  background:var(--bg2);
+  border:0.5px solid var(--border);
+  border-radius:var(--radius-lg);
+  padding:16px 18px;
+  margin-bottom:14px;
+}
+.card-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;}
+.card-title{font-size:13px;font-weight:500;}
+
+/* ── グリッドレイアウト ──
+   フォームの入力欄を均等に並べるためのグリッド。 */
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px;}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-bottom:10px;}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:16px;}
+
+/* ── サマリーカード ──
+   チーム数・正常数・異常数などの集計値を大きく表示するカード。 */
+.stat-card{background:var(--bg3);border-radius:var(--radius);padding:12px 14px;}
+.stat-label{font-size:11px;color:var(--text2);margin-bottom:4px;}
+.stat-val{font-size:22px;font-weight:600;}
+
+/* ── フォーム要素 ──
+   label・input・select・textarea の基本スタイル。 */
+label{display:block;font-size:12px;color:var(--text2);margin-bottom:4px;}
+input,select,textarea{
+  width:100%;
+  padding:6px 10px;
+  border:0.5px solid var(--border2);
+  border-radius:var(--radius);
+  background:var(--bg);
+  color:var(--text);
+  font-size:13px;
+  font-family:inherit;
+}
+/* フォーカス時: アクセントカラーでリングを表示し視認性を高める */
+input:focus,select:focus,textarea:focus{
+  outline:none;
+  border-color:var(--accent);
+  box-shadow:0 0 0 2px rgba(23,143,212,.15);
+}
+textarea{resize:vertical;font-family:var(--mono);font-size:12px;}
+
+/* ── ボタンコンポーネント ──
+   btn: 基本スタイル（サイズ・カーソル・アニメーション）
+   btn-primary: 主要アクション（塗り潰しボタン）
+   btn-ghost:   副次アクション（枠線ボタン）
+   btn-danger:  削除・初期化などの危険な操作（赤枠ボタン）
+   btn-sm:      小サイズ */
+.btn{
+  padding:6px 14px;
+  border-radius:var(--radius);
+  font-size:13px;cursor:pointer;
+  display:inline-flex;align-items:center;gap:5px;
+  transition:opacity .12s,background .12s;
+}
+.btn-primary{background:var(--accent);color:#fff;border:none;}
+.btn-primary:hover{opacity:.88;}
+.btn-ghost{background:none;border:0.5px solid var(--border2);color:var(--text);}
+.btn-ghost:hover{background:var(--bg3);}
+.btn-danger{background:none;border:0.5px solid #E24B4A;color:var(--err);}
+.btn-danger:hover{background:var(--err-bg);}
+.btn-sm{padding:4px 10px;font-size:12px;}
+/* ボタン群のラッパー: 保存ボタン等を横並びにする */
+.btn-row{display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;}
+
+/* ── テーブルコンポーネント ──
+   SLA状態一覧・Measurement一覧などに使用。 */
+.tbl{width:100%;border-collapse:collapse;font-size:13px;}
+.tbl th{text-align:left;padding:7px 10px;font-weight:500;color:var(--text2);border-bottom:0.5px solid var(--border);}
+.tbl td{padding:7px 10px;border-bottom:0.5px solid var(--border);vertical-align:middle;}
+.tbl tr:last-child td{border-bottom:none;} /* 最終行の下線を除去 */
+/* テーブルを角丸ボックスで囲むラッパー */
+.tbl-wrap{background:var(--bg2);border:0.5px solid var(--border);border-radius:var(--radius-lg);overflow:hidden;margin-bottom:14px;}
+
+/* ── バッジコンポーネント ──
+   ステータス・種別を小さなラベルで示す。
+   badge-ok: 正常 / badge-err: エラー / badge-warn: 警告 / badge-info: 情報 / badge-gray: 中立 */
+.badge{font-size:11px;padding:2px 8px;border-radius:20px;font-weight:500;white-space:nowrap;}
+.badge-ok{background:var(--ok-bg);color:var(--ok);}
+.badge-err{background:var(--err-bg);color:var(--err);}
+.badge-warn{background:var(--warn-bg);color:var(--warn);}
+.badge-info{background:var(--accent-bg);color:var(--accent-text);}
+.badge-gray{background:var(--bg3);color:var(--text2);border:0.5px solid var(--border);}
+
+/* ── SLA状態インジケータ (pip) ──
+   状態確認テーブルの各セルに表示する小さな四角いアイコン。
+   pip-ok: 緑（正常） / pip-err: 赤（異常） / pip-na: グレー（未確認） */
+.pip{width:16px;height:16px;border-radius:3px;display:inline-flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff;}
+.pip-ok{background:#639922;}
+.pip-err{background:#E24B4A;}
+.pip-na{background:var(--border2);}
+
+/* ── IPアドレスブロック (監視ターゲットタブ) ──
+   SLA項目ごとのカード。ヘッダ + エントリ一覧 + 追加フォームで構成。 */
+.ip-block{border:0.5px solid var(--border);border-radius:var(--radius-lg);margin-bottom:12px;overflow:hidden;}
+.ip-block-head{display:flex;align-items:center;gap:8px;padding:9px 14px;background:var(--bg3);border-bottom:0.5px solid var(--border);}
+.ip-block-title{font-size:13px;font-weight:500;flex:1;}
+.ip-block-body{padding:10px 14px;}
+/* 各 IP エントリ行: チーム名ラベル・IP入力欄・削除ボタンの3列グリッド */
+.ip-entry{display:grid;grid-template-columns:90px 1fr auto;gap:8px;align-items:center;padding:4px 0;border-bottom:0.5px solid var(--border);}
+.ip-entry:last-child{border-bottom:none;}
+.ip-team-lbl{font-size:12px;color:var(--text2);font-family:var(--mono);}
+/* エントリ追加フォーム行: チーム名・IP・追加ボタンの3列グリッド */
+.ip-add{display:grid;grid-template-columns:100px 1fr auto;gap:8px;align-items:end;padding-top:8px;border-top:0.5px dashed var(--border2);margin-top:6px;}
+
+/* ── トースト通知 ──
+   画面右下に一定時間表示する操作結果メッセージ。
+   JS で display を切り替えて表示・非表示を制御する。 */
+#toast{
+  position:fixed;bottom:20px;right:20px;
+  background:#222;color:#f0ede6;
+  padding:9px 16px;border-radius:var(--radius);
+  font-size:13px;z-index:9999;display:none;max-width:360px;
+}
+
+/* ── ログ表示 ──
+   等幅フォントで時刻・チーム・テキストを横並びに表示。
+   レベルに応じて文字色を変える。 */
+.log-line{display:flex;gap:10px;padding:4px 0;border-bottom:0.5px solid var(--border);font-family:var(--mono);font-size:12px;}
+.log-line:last-child{border-bottom:none;}
+.log-time{color:var(--text2);min-width:120px;}
+.log-ok{color:var(--ok);}
+.log-err{color:var(--err);}
+.log-warn{color:var(--warn);}
+
+/* ── crontab プレビュー ──
+   生成される cron エントリを等幅フォントで表示するプリフォーマット領域。 */
+.cron-pre{
+  background:var(--bg3);border-radius:var(--radius);
+  padding:8px 10px;font-size:12px;color:var(--text2);
+  font-family:var(--mono);white-space:pre;overflow-x:auto;
+}
+
+/* ── インフォバー ──
+   タブ内の補足説明をアクセントカラーで目立たせるバー。 */
+.info-bar{background:var(--accent-bg);color:var(--accent-text);font-size:12px;padding:7px 12px;border-radius:var(--radius);margin-bottom:12px;}
+
+/* ── セクションヘッダ ──
+   タイトルとアクションボタンを左右に配置するフレックス行。 */
+.sec-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+.sec-title{font-size:14px;font-weight:500;}
+/* セクション間の区切り線 */
+.divider{height:0.5px;background:var(--border);margin:14px 0;}
+
+/* ── モーダルダイアログ ──
+   SLA項目追加フォームをオーバーレイとして表示する。
+   .modal-bg: 半透明の背景オーバーレイ（クリックで閉じない実装）
+   .open クラスを付与すると表示される。 */
+.modal-bg{
+  display:none;
+  position:fixed;inset:0;  /* top/right/bottom/left すべて 0 */
+  background:rgba(0,0,0,.45);
+  z-index:1000;
+  align-items:center;justify-content:center;
+}
+.modal-bg.open{display:flex;}
+/* モーダル本体: 中央に配置される白いボックス */
+.modal{
+  background:var(--bg2);
+  border:0.5px solid var(--border2);
+  border-radius:var(--radius-lg);
+  padding:22px 24px;
+  width:440px;max-width:92vw;  /* 狭い画面でも横にはみ出さない */
+}
+.modal-title{font-size:15px;font-weight:500;margin-bottom:16px;}
+
+/* ── ローディングスピナー ──
+   API通信中に表示する回転アニメーション。
+   CSS アニメーションのみで実装（JS不要）。 */
+.spin{
+  display:inline-block;
+  width:14px;height:14px;
+  border:2px solid var(--border2);
+  border-top-color:var(--accent);  /* 上部だけアクセントカラーにして回転感を演出 */
+  border-radius:50%;
+  animation:spin .6s linear infinite;
+  vertical-align:-3px;
+}
+@keyframes spin{to{transform:rotate(360deg);}}
+</style>
+</head>
+<body>
+
+<div class="app">
+
+  <!--
+    ═══════════════════════════════════════
+    サイドバー: ナビゲーション
+    ═══════════════════════════════════════
+    各ボタンが switchTab() を呼び出してタブを切り替える。
+    id="nav-<タブ名>" でアクティブ状態を JS から制御する。
+  -->
+  <nav class="sidebar">
+    <!-- ロゴ・アプリ名 -->
+    <div class="sidebar-logo">
+      <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="9"/><path d="M12 3v4M12 17v4M3 12h4M17 12h4"/>
+      </svg>
+      <span class="sidebar-title">SLA Console</span>
+    </div>
+
+    <!-- 状態確認タブ: SLA チェック結果の一覧 -->
+    <button class="nav-item active" onclick="switchTab('status')" id="nav-status">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/>
+        <rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+      </svg>
+      状態確認
+    </button>
+
+    <!-- チーム管理タブ: チームの追加・削除・有効化 -->
+    <button class="nav-item" onclick="switchTab('teams')" id="nav-teams">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+        <circle cx="9" cy="7" r="4"/>
+        <path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+      </svg>
+      チーム管理
+    </button>
+
+    <!-- 監視ターゲットタブ: SLA項目×チームのIPアドレス管理 -->
+    <button class="nav-item" onclick="switchTab('targets')" id="nav-targets">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>
+      </svg>
+      監視ターゲット
+    </button>
+
+    <!-- スケジュールタブ: crontab 設定・HTTP タイムアウト -->
+    <button class="nav-item" onclick="switchTab('schedule')" id="nav-schedule">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>
+      </svg>
+      スケジュール
+    </button>
+
+    <!-- データベースタブ: InfluxDB 接続設定・Measurement管理 -->
+    <button class="nav-item" onclick="switchTab('database')" id="nav-database">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <ellipse cx="12" cy="5" rx="9" ry="3"/>
+        <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/>
+        <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>
+      </svg>
+      データベース
+    </button>
+
+    <!-- ログタブ: check-sla.sh の実行ログ確認 -->
+    <button class="nav-item" onclick="switchTab('logs')" id="nav-logs">
+      <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+        <path d="M14 2v6h6"/>
+        <line x1="16" y1="13" x2="8" y2="13"/>
+        <line x1="16" y1="17" x2="8" y2="17"/>
+        <line x1="10" y1="9" x2="8" y2="9"/>
+      </svg>
+      ログ
+    </button>
+
+    <!-- フレックスの余白埋め: ステータス表示をサイドバー最下部に押し込む -->
+    <div style="flex:1"></div>
+
+    <!-- API 接続状態インジケータ: init() 関数が更新する -->
+    <div style="padding:12px 16px;font-size:11px;color:var(--text2);border-top:0.5px solid var(--border);">
+      <span id="api-status">● API未接続</span>
+    </div>
+  </nav>
+
+  <!--
+    ═══════════════════════════════════════
+    メインエリア: トップバー + タブパネル
+    ═══════════════════════════════════════
+  -->
+  <div class="main">
+
+    <!--
+      トップバー: 現在タブのタイトル・全体操作ボタンを常時表示
+      「今すぐ実行」: 全チームの SLA チェックを即時トリガー
+      「param.py」: 現在設定から生成した param.py をダウンロード
+    -->
+    <div class="topbar">
+      <span class="topbar-title" id="page-title">状態確認</span>
+      <span id="last-run" style="font-size:12px;color:var(--text2);">最終チェック: —</span>
+      <button class="btn btn-ghost btn-sm" onclick="runCheck()">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path d="M23 4v6h-6"/><path d="M1 20v-6h6"/>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10"/>
+          <path d="M20.49 15a9 9 0 0 1-14.85 3.36L1 14"/>
+        </svg>
+        今すぐ実行
+      </button>
+      <!-- href="/api/export/param-py": Flask が Content-Disposition: attachment で返すので自動ダウンロード -->
+      <a href="/api/export/param-py" class="btn btn-ghost btn-sm">
+        <svg width="14" height="14" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+          <polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+        </svg>
+        param.py
+      </a>
+    </div>
+
+    <!-- タブパネルのコンテナ -->
+    <div class="content">
+
+      <!--
+        ══════════════════════════════
+        パネル: 状態確認
+        ══════════════════════════════
+        SLA チェック実行後の結果をリアルタイムで表示する。
+        テーブルのヘッダ・行は SLA 項目数に応じて JS で動的生成。
+      -->
+      <div id="panel-status" class="panel">
+        <!-- サマリーカード群: 有効チーム数・SLA項目数・正常/異常チーム数 -->
+        <div class="grid4" id="stat-cards">
+          <div class="stat-card">
+            <div class="stat-label">有効チーム数</div>
+            <div class="stat-val" id="s-teams">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label">SLA項目数</div>
+            <div class="stat-val" id="s-slas">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label" style="color:var(--ok)">正常</div>
+            <div class="stat-val" id="s-ok" style="color:var(--ok)">—</div>
+          </div>
+          <div class="stat-card">
+            <div class="stat-label" style="color:var(--err)">異常検出</div>
+            <div class="stat-val" id="s-err" style="color:var(--err)">—</div>
+          </div>
+        </div>
+
+        <!-- チーム別SLA状態テーブル: JS が renderCheckResults() で動的生成 -->
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead id="status-thead"></thead><!-- JS が SLA 項目列を動的生成 -->
+            <tbody id="status-tbody">
+              <tr>
+                <td colspan="10" style="text-align:center;padding:24px;color:var(--text2)">
+                  「今すぐ実行」でチェックしてください
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="info-bar">ping疎通はTTL含有で判定、HTTP系は"menu"文字列含有で判定します。</div>
+      </div>
+
+      <!--
+        ══════════════════════════════
+        パネル: チーム管理
+        ══════════════════════════════
+        チームの追加・削除・ID変更・有効/無効を管理する。
+        renderTeams() が #team-list にカードを動的生成する。
+      -->
+      <div id="panel-teams" class="panel" style="display:none">
+        <div class="sec-head">
+          <span class="sec-title">チーム設定</span>
+          <!-- addTeam(): state.teams に新チームを追加して再描画 -->
+          <button class="btn btn-primary btn-sm" onclick="addTeam()">＋ チーム追加</button>
+        </div>
+        <!-- JS の renderTeams() がここにチームカードを動的挿入する -->
+        <div id="team-list"></div>
+        <div class="btn-row">
+          <!-- saveTeams(): state.teams を /api/teams に POST して永続化 -->
+          <button class="btn btn-primary" onclick="saveTeams()">保存</button>
+        </div>
+      </div>
+
+      <!--
+        ══════════════════════════════
+        パネル: 監視ターゲット管理
+        ══════════════════════════════
+        SLA 項目ごとのブロックを renderTargets() が #target-blocks に動的生成する。
+        各ブロック内でIPアドレスのインライン編集・追加・削除ができる。
+      -->
+      <div id="panel-targets" class="panel" style="display:none">
+        <div class="sec-head" style="margin-bottom:8px;">
+          <span class="sec-title">監視ターゲット管理</span>
+          <div style="display:flex;gap:8px;">
+            <!-- openAddSlaModal(): 新規SLA項目追加モーダルを表示 -->
+            <button class="btn btn-primary btn-sm" onclick="openAddSlaModal()">＋ SLA項目追加</button>
+            <!-- saveTargets(): state.targets を /api/targets に POST → param.py も自動更新 -->
+            <button class="btn btn-ghost btn-sm" onclick="saveTargets()">保存 &amp; param.py更新</button>
+          </div>
+        </div>
+        <div class="info-bar">
+          SLA項目ごとにチームのターゲットIPを追加・編集・削除できます。「保存」でparam.pyも自動更新されます。
+        </div>
+        <!-- JS の renderTargets() がここに SLA ブロックを動的挿入する -->
+        <div id="target-blocks"></div>
+      </div>
+
+      <!--
+        ══════════════════════════════
+        パネル: スケジュール設定
+        ══════════════════════════════
+        crontab の実行間隔と check-sla.sh のパスを設定する。
+        入力値が変わるたびに updateCronPre() が crontab プレビューをリアルタイム更新。
+      -->
+      <div id="panel-schedule" class="panel" style="display:none">
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">crontab 設定</span>
+            <!-- check-sla.sh が対象スクリプトであることを示すバッジ -->
+            <span class="badge badge-info">check-sla.sh</span>
+          </div>
+
+          <!-- cron 式の分・時・日月曜日フィールド: oninput でリアルタイムプレビュー更新 -->
+          <div class="grid3">
+            <div><label>分 (minute)</label><input id="cron-min" value="*/5" oninput="updateCronPre()"></div>
+            <div><label>時 (hour)</label><input id="cron-hour" value="*" oninput="updateCronPre()"></div>
+            <div><label>日/月/曜日</label><input id="cron-rest" value="* * *" oninput="updateCronPre()"></div>
+          </div>
+
+          <!-- cron 式の人間可読説明文: updateCronPre() が書き換える -->
+          <div style="margin-bottom:10px;font-size:12px;color:var(--text2)" id="cron-desc"></div>
+
+          <!-- クイック設定ボタン群: setCron() でよく使う間隔を一発設定 -->
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+            <button class="btn btn-ghost btn-sm" onclick="setCron('*/1','*','* * *')">毎分</button>
+            <button class="btn btn-ghost btn-sm" onclick="setCron('*/5','*','* * *')">5分ごと</button>
+            <button class="btn btn-ghost btn-sm" onclick="setCron('*/10','*','* * *')">10分ごと</button>
+            <button class="btn btn-ghost btn-sm" onclick="setCron('*/30','*','* * *')">30分ごと</button>
+            <button class="btn btn-ghost btn-sm" onclick="setCron('0','*','* * *')">毎時0分</button>
+            <button class="btn btn-ghost btn-sm" onclick="setCron('0','0','* * *')">毎日0時</button>
+          </div>
+
+          <!-- check-sla.sh のフルパス: サーバー上のスクリプト配置場所に合わせて変更 -->
+          <label>スクリプトパス</label>
+          <input id="script-path" value="/home/user/check-sla.sh" style="margin-bottom:12px;">
+
+          <!-- 生成される crontab エントリのプレビュー: updateCronPre() が書き換える -->
+          <label>生成されるcrontab（全チーム）</label>
+          <div class="cron-pre" id="cron-out" style="margin-bottom:12px;"></div>
+
+          <div class="btn-row">
+            <!-- saveSchedule(): /api/schedule に POST → サーバーが crontab -l / crontab - を実行 -->
+            <button class="btn btn-primary" onclick="saveSchedule()">crontabに適用</button>
+            <!-- copyCron(): crontab プレビューをクリップボードにコピー（手動貼り付け用） -->
+            <button class="btn btn-ghost" onclick="copyCron()">コピー</button>
+          </div>
+        </div>
+
+        <!-- HTTP タイムアウト設定: param.py の http_timeout 変数に反映される -->
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">HTTPタイムアウト</span>
+            <span class="badge badge-gray">param.py</span>
+          </div>
+          <div class="grid2">
+            <div>
+              <label>http_timeout（秒）</label>
+              <!-- step="0.5": 0.5秒刻みで増減できる。SLA06 等 HTTP チェックに影響 -->
+              <input type="number" id="http-timeout" value="7.0" step="0.5" min="1" max="60">
+            </div>
+            <div style="display:flex;align-items:flex-end;">
+              <div style="font-size:12px;color:var(--text2);padding:8px 0;">SLA HTTP系リクエストのタイムアウト値</div>
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-primary" onclick="saveSchedule()">保存</button>
+          </div>
+        </div>
+      </div>
+
+      <!--
+        ══════════════════════════════
+        パネル: データベース管理
+        ══════════════════════════════
+        InfluxDB への接続情報管理と Measurement の確認・削除を行う。
+      -->
+      <div id="panel-database" class="panel" style="display:none">
+
+        <!-- 接続設定フォーム -->
+        <div class="card">
+          <div class="card-head">
+            <span class="card-title">InfluxDB 接続設定</span>
+            <span class="badge badge-gray">param.py</span>
+          </div>
+          <div class="grid2">
+            <div><label>ホスト (db_host)</label><input id="db-host" value="localhost"></div>
+            <div><label>ポート (db_port)</label><input id="db-port" value="8086"></div>
+          </div>
+          <div class="grid2">
+            <div><label>ユーザー名</label><input id="db-user" value="user"></div>
+            <!-- パスワードは GET レスポンスに含まれないため、変更時のみ入力する設計 -->
+            <div><label>パスワード</label><input type="password" id="db-pass" placeholder="変更する場合のみ入力"></div>
+          </div>
+          <div style="margin-bottom:10px;">
+            <label>データベース名</label><input id="db-name" value="bc_db">
+          </div>
+          <div class="btn-row">
+            <!-- testDb(): /api/database/test に POST して実際の接続を確認 -->
+            <button class="btn btn-primary" onclick="testDb()">接続テスト</button>
+            <!-- saveDb(): /api/database に POST → config/database.json と param.py を更新 -->
+            <button class="btn btn-ghost" onclick="saveDb()">保存</button>
+          </div>
+          <!-- 接続テスト結果表示エリア: testDb() が更新する -->
+          <div id="db-test-result" style="margin-top:8px;font-size:12px;"></div>
+        </div>
+
+        <!-- Measurement 一覧: loadMeasurements() が InfluxDB に問い合わせて動的生成 -->
+        <div class="sec-head" style="margin-top:4px;">
+          <span class="sec-title">登録済み Measurement</span>
+          <!-- loadMeasurements(): /api/database/measurements を GET して一覧を更新 -->
+          <button class="btn btn-ghost btn-sm" onclick="loadMeasurements()">更新</button>
+        </div>
+        <div class="tbl-wrap">
+          <table class="tbl">
+            <thead>
+              <tr>
+                <th>Measurement</th><!-- チームIDに対応 (例: team01) -->
+                <th>行数</th>        <!-- SELECT count(*) で取得した記録数 -->
+                <th>状態</th>        <!-- 接続中バッジを表示 -->
+                <th></th>            <!-- 個別初期化ボタン列 -->
+              </tr>
+            </thead>
+            <!-- loadMeasurements() がここに行を動的挿入する -->
+            <tbody id="meas-tbody">
+              <tr><td colspan="4" style="text-align:center;padding:20px;color:var(--text2)">「更新」で取得</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- 危険な操作ゾーン: 誤操作防止のため赤枠で強調 -->
+        <div class="sec-head" style="margin-top:4px;">
+          <span class="sec-title" style="color:var(--err);">危険な操作</span>
+        </div>
+        <div class="card" style="border-color:#F7C1C1;">
+          <div style="font-size:13px;color:var(--text2);margin-bottom:10px;">
+            特定チームまたは全データを削除します。この操作は元に戻せません。
+          </div>
+          <div class="grid2">
+            <div>
+              <label>初期化対象チーム</label>
+              <!-- syncTeamSelects() がチーム一覧と同期する -->
+              <select id="reset-team"><option value="">— 選択 —</option></select>
+            </div>
+            <div style="display:flex;align-items:flex-end;gap:8px;">
+              <!-- resetTeam(): 選択チームの Measurement を drop_measurement で削除 -->
+              <button class="btn btn-danger" onclick="resetTeam()">選択チームを初期化</button>
+              <!-- resetAll(): DB全体を drop → create で完全初期化。confirm を2回表示 -->
+              <button class="btn btn-danger" onclick="resetAll()">⚠ 全データ初期化</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!--
+        ══════════════════════════════
+        パネル: ログ確認
+        ══════════════════════════════
+        /home/user/log/sla_<team>_<日付>.log を API 経由で取得して表示。
+        チームセレクトで絞り込みができる。
+      -->
+      <div id="panel-logs" class="panel" style="display:none">
+        <div class="sec-head">
+          <span class="sec-title">実行ログ</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <!-- onchange="loadLogs()": チーム変更時に自動でログを再取得 -->
+            <select id="log-team-sel" style="width:130px;font-size:12px;" onchange="loadLogs()">
+              <option value="">全チーム</option>
+            </select>
+            <button class="btn btn-ghost btn-sm" onclick="loadLogs()">更新</button>
+          </div>
+        </div>
+        <!-- loadLogs() がここにログ行を動的挿入する -->
+        <div class="card" style="padding:6px 14px;">
+          <div id="log-list">
+            <div style="text-align:center;padding:20px;color:var(--text2);font-size:13px;">「更新」でログを取得</div>
+          </div>
+        </div>
+      </div>
+
+    </div><!-- /.content -->
+  </div><!-- /.main -->
+</div><!-- /.app -->
+
+<!--
+  ══════════════════════════════
+  モーダル: SLA項目追加
+  ══════════════════════════════
+  .modal-bg に .open クラスを付けると表示される。
+  position:fixed で画面全体を覆い、モーダル本体はフレックスで中央配置。
+-->
+<div class="modal-bg" id="add-sla-modal">
+  <div class="modal">
+    <div class="modal-title">SLA項目を追加</div>
+    <div class="grid2">
+      <!-- SLA ID: "sla07" のように小文字で入力。confirmAddSla() で toLowerCase() する -->
+      <div><label>SLA ID（例: sla07）</label><input id="new-sla-id" placeholder="sla07"></div>
+      <!-- チェック種別: ping = ICMP疎通確認 / http = HTTP レスポンス確認 -->
+      <div>
+        <label>チェック種別</label>
+        <select id="new-sla-type">
+          <option value="ping">ping</option>
+          <option value="http">HTTP</option>
+        </select>
+      </div>
+    </div>
+    <!-- 説明: param.py のコメント行として埋め込まれる -->
+    <div style="margin-bottom:10px;">
+      <label>説明（省略可）</label>
+      <input id="new-sla-desc" placeholder="例: 外部ルータ疎通確認">
+    </div>
+    <!-- デフォルトIP: 全チームの初期値として設定される。後から個別変更可 -->
+    <div style="margin-bottom:10px;">
+      <label>デフォルトIP（全チームに適用）</label>
+      <input id="new-sla-ip" placeholder="0.0.0.0">
+    </div>
+    <div class="btn-row">
+      <!-- confirmAddSla(): バリデーション後に state.targets に追加して再描画 -->
+      <button class="btn btn-primary" onclick="confirmAddSla()">追加</button>
+      <!-- closeAddSlaModal(): .open を除去してモーダルを閉じる -->
+      <button class="btn btn-ghost" onclick="closeAddSlaModal()">キャンセル</button>
+    </div>
+  </div>
+</div>
+
+<!-- トースト通知用の要素: toast() 関数が textContent と display を制御する -->
+<div id="toast"></div>
+
+<script>
+/*
+  ══════════════════════════════════════════════════════════
+  JavaScript: アプリケーションロジック
+  ══════════════════════════════════════════════════════════
+
+  設計方針:
+    - グローバル state オブジェクトで全設定を一元管理
+    - 画面描画は常に state から行い、DOM を source of truth にしない
+    - API 通信は async/await + fetch で統一
+    - 各タブの読み込みはタブ切替時に遅延実行（初期表示を高速化）
+*/
+
+/*
+  API ベース URL:
+  Flask が同一オリジンで index.html を配信するため空文字で OK。
+  別ドメインの場合は "http://192.168.1.1:5000" のように絶対 URL を設定する。
+*/
+const API = "";
+
+/*
+  グローバル状態オブジェクト:
+    teams   : チーム設定の配列 [{id, name, enabled}, ...]
+    targets : 監視ターゲット設定 {sla01: {type, desc, ips}, ...}
+    schedule: スケジュール設定 {cron_min, cron_hour, cron_rest, http_timeout, script_path}
+    db      : DB接続設定 {host, port, username, name}（パスワードは含まない）
+*/
+let state = { teams: [], targets: {}, schedule: {}, db: {} };
+
+
+// ══════════════════════════════
+// ユーティリティ関数
+// ══════════════════════════════
+
+/**
+ * 画面右下にトースト通知を表示する。
+ *
+ * @param {string} msg  - 表示するメッセージ
+ * @param {string} type - "ok"（黒背景）または "err"（赤背景）
+ * @param {number} dur  - 表示時間（ミリ秒）
+ *
+ * 実装:
+ *   既存のタイマーを clearTimeout でキャンセルしてから新しいタイマーをセットすることで、
+ *   連続呼び出し時でも常に最新のメッセージが指定時間表示される。
+ */
+function toast(msg, type="ok", dur=2600) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  t.style.background = type === "err" ? "#7a1f1f" : "#222";
+  clearTimeout(t._timer);  // 前のタイマーをキャンセル
+  t._timer = setTimeout(() => t.style.display = "none", dur);
+}
+
+/**
+ * Flask REST API に非同期リクエストを送り、JSON レスポンスを返す。
+ *
+ * @param {string} path   - APIパス (例: "/api/teams")
+ * @param {string} method - HTTPメソッド ("GET" | "POST" | "DELETE")
+ * @param {Object} body   - リクエストボディ（POST時のみ。null なら送信しない）
+ * @returns {Promise<Object>} - レスポンスを JSON デコードした結果
+ *
+ * 注意:
+ *   エラーレスポンス（4xx / 5xx）でも response.json() を呼ぶため、
+ *   呼び出し側で {"ok": false, "message": "..."} を確認すること。
+ *   ネットワークエラーは例外としてスローされるので、必要に応じて .catch() を付ける。
+ */
+async function api(path, method="GET", body=null) {
+  const opts = { method, headers: { "Content-Type": "application/json" } };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(API + path, opts);
+  return r.json();
+}
+
+/**
+ * アクティブなタブを切り替える。
+ *
+ * 処理:
+ *   1. 全パネルを非表示、全ナビボタンから active を除去
+ *   2. 指定タブのパネルを表示し、ナビボタンに active を付与
+ *   3. トップバーのタイトルを更新
+ *   4. そのタブのデータ取得関数を呼び出す（遅延ロード）
+ *
+ * @param {string} name - タブ名 ("status"|"teams"|"targets"|"schedule"|"database"|"logs")
+ */
+function switchTab(name) {
+  // 全タブを非表示にし、ナビボタンのアクティブ状態をリセット
+  ["status","teams","targets","schedule","database","logs"].forEach(n => {
+    document.getElementById("panel-" + n).style.display = n === name ? "" : "none";
+    document.getElementById("nav-" + n).classList.toggle("active", n === name);
+  });
+
+  // トップバータイトルをタブ名に対応する日本語に更新
+  const titles = {
+    status:   "状態確認",
+    teams:    "チーム管理",
+    targets:  "監視ターゲット",
+    schedule: "スケジュール",
+    database: "データベース",
+    logs:     "ログ"
+  };
+  document.getElementById("page-title").textContent = titles[name] || name;
+
+  // タブごとのデータ取得関数を呼び出す（タブ表示のたびに最新データを取得）
+  if (name === "teams")    loadTeams();
+  if (name === "targets")  loadTargets();
+  if (name === "schedule") loadSchedule();
+  if (name === "database") loadDb();
+  if (name === "logs")     loadLogs();
+}
+
+
+// ══════════════════════════════
+// 状態確認パネル
+// ══════════════════════════════
+
+/**
+ * SLA チェックを今すぐ手動実行する（トップバーの「今すぐ実行」ボタン）。
+ *
+ * 処理:
+ *   1. ボタンを disabled にして二重送信を防止
+ *   2. /api/run-check に POST → Flask が check-sla.sh を全チームで実行
+ *   3. 結果を renderCheckResults() で描画
+ *   4. ボタンを有効に戻す
+ */
+async function runCheck() {
+  toast("SLAチェック実行中...", "ok", 8000);
+  const btn = document.querySelector('[onclick="runCheck()"]');
+  btn.disabled = true;
+
+  // teams: null → サーバー側で全有効チームを対象にする
+  const data = await api("/api/run-check", "POST", { teams: null })
+    .catch(e => ({ ok: false, results: [] })); // ネットワークエラー時のフォールバック
+
+  btn.disabled = false;
+  document.getElementById("last-run").textContent =
+    "最終チェック: " + new Date().toLocaleTimeString("ja-JP");
+  renderCheckResults(data.results || []);
+  toast(
+    data.ok ? `チェック完了 (${(data.results||[]).length}チーム)` : "チェックエラー",
+    data.ok ? "ok" : "err"
+  );
+}
+
+/**
+ * SLA チェック結果をテーブルに描画する。
+ *
+ * @param {Array} results - /api/run-check のレスポンス results 配列
+ *   [{team: "team01", ok: true, stdout: "...", stderr: ""}, ...]
+ *
+ * 処理:
+ *   - state.targets のキーから SLA 列を動的生成（SLA 項目数に対応）
+ *   - チームごとに pip (✓/✗) と正常/異常バッジを表示
+ *   - サマリーカードの正常数・異常数を更新
+ *
+ * 制限:
+ *   現在は check-sla.sh の終了コードだけで正常/異常を判定しており、
+ *   SLA 項目ごとの個別結果は表示しない（全列が同じ色になる）。
+ *   sla.py の stdout パースで個別結果を取得する実装に拡張可能。
+ */
+function renderCheckResults(results) {
+  const slaKeys = Object.keys(state.targets);
+
+  // テーブルヘッダを SLA 項目数に合わせて動的生成
+  const thead = document.getElementById("status-thead");
+  thead.innerHTML = `<tr><th>チーム</th>${slaKeys.map(k => `<th>${k}</th>`).join("")}<th>状態</th></tr>`;
+
+  const tbody = document.getElementById("status-tbody");
+  tbody.innerHTML = "";
+
+  // サマリーカードの更新
+  document.getElementById("s-teams").textContent = state.teams.filter(t => t.enabled).length;
+  document.getElementById("s-slas").textContent = slaKeys.length;
+
+  let ok = 0, err = 0;
+  results.forEach(r => {
+    r.ok ? ok++ : err++;
+    const tr = document.createElement("tr");
+    // 各 SLA 列に pip を表示（現状は全列が同じ ok/err 状態）
+    const pips = slaKeys.map(k =>
+      `<td><span class="pip ${r.ok ? 'pip-ok' : 'pip-err'}">${r.ok ? '✓' : '✗'}</span></td>`
+    ).join("");
+    tr.innerHTML = `
+      <td style="font-weight:500">${r.team}</td>
+      ${pips}
+      <td>${r.ok
+        ? '<span class="badge badge-ok">正常</span>'
+        : '<span class="badge badge-err">異常あり</span>'}</td>`;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("s-ok").textContent = ok;
+  document.getElementById("s-err").textContent = err;
+}
+
+
+// ══════════════════════════════
+// チーム管理パネル
+// ══════════════════════════════
+
+/**
+ * /api/teams からチーム一覧を取得して state に格納し、描画する。
+ */
+async function loadTeams() {
+  state.teams = await api("/api/teams");
+  renderTeams();
+  syncTeamSelects(); // リセット・ログのセレクトボックスも同期
+}
+
+/**
+ * state.teams をもとにチームカード一覧を #team-list に描画する。
+ *
+ * 各カード:
+ *   - チームID / 表示名の編集フォーム（onchange で state を即時更新）
+ *   - 有効/無効チェックボックス
+ *   - 削除ボタン
+ */
+function renderTeams() {
+  const el = document.getElementById("team-list");
+  el.innerHTML = "";
+  state.teams.forEach((t, i) => {
+    const d = document.createElement("div");
+    d.className = "card";
+    d.style.marginBottom = "8px";
+    d.innerHTML = `
+      <div class="card-head">
+        <span class="card-title">${t.id}</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <label style="margin:0;display:flex;align-items:center;gap:4px;font-size:12px;cursor:pointer;">
+            <!-- チェックボックス変更時に state を即時更新（保存ボタンを押すまでは永続化しない） -->
+            <input type="checkbox" ${t.enabled ? "checked" : ""} onchange="state.teams[${i}].enabled=this.checked" style="width:auto">有効
+          </label>
+          <button class="btn btn-danger btn-sm" onclick="removeTeam(${i})">削除</button>
+        </div>
+      </div>
+      <div class="grid2">
+        <!-- onchange で state.teams[i].id を即時更新 -->
+        <div><label>チームID</label><input value="${t.id}" onchange="state.teams[${i}].id=this.value"></div>
+        <div><label>表示名</label><input value="${t.name}" onchange="state.teams[${i}].name=this.value"></div>
+      </div>`;
+    el.appendChild(d);
+  });
+  if (!state.teams.length) {
+    el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text2)">チームが登録されていません</div>';
+  }
+}
+
+/**
+ * 新しいチームを state に追加して再描画する。
+ *
+ * チームID は "team" + ゼロ埋め2桁の連番で自動生成。
+ * 既存の全 SLA ターゲットに "0.0.0.0" のプレースホルダー IP を追加して
+ * チーム数と IP リスト長の整合性を保つ。
+ * ※ 保存ボタンを押すまでサーバーには送信されない。
+ */
+function addTeam() {
+  const n = state.teams.length + 1;
+  const id = "team" + String(n).padStart(2, "0");
+  state.teams.push({ id, name: id, enabled: true });
+  // 全 SLA ターゲットの ips 配列に新チーム分の要素を追加（整合性維持）
+  Object.values(state.targets).forEach(s => s.ips.push("0.0.0.0"));
+  renderTeams();
+}
+
+/**
+ * 指定インデックスのチームを state から削除して再描画する。
+ *
+ * @param {number} i - 削除するチームの配列インデックス
+ *
+ * 副作用:
+ *   全 SLA ターゲットの ips 配列から同インデックスの要素も削除する（整合性維持）。
+ *   ※ 保存ボタンを押すまでサーバーには送信されない。
+ */
+function removeTeam(i) {
+  if (!confirm(`${state.teams[i].id} を削除しますか？`)) return;
+  state.teams.splice(i, 1);
+  Object.values(state.targets).forEach(s => s.ips.splice(i, 1));
+  renderTeams();
+}
+
+/**
+ * state.teams を /api/teams に POST して永続化し、param.py を再生成させる。
+ */
+async function saveTeams() {
+  const res = await api("/api/teams", "POST", state.teams);
+  toast(res.message || "保存しました", res.ok ? "ok" : "err");
+  syncTeamSelects();
+}
+
+
+// ══════════════════════════════
+// 監視ターゲットパネル
+// ══════════════════════════════
+
+/**
+ * /api/targets からターゲット設定を取得して state に格納し、描画する。
+ */
+async function loadTargets() {
+  state.targets = await api("/api/targets");
+  renderTargets();
+}
+
+/**
+ * state.targets をもとに SLA ブロック一覧を #target-blocks に描画する。
+ *
+ * 各ブロックの構成:
+ *   - ヘッダ: SLA ID・種別バッジ・説明・SLA削除ボタン
+ *   - エントリ行: チーム名ラベル・IP入力欄・行削除ボタン（state.teams と対応）
+ *   - 追加フォーム: チーム名入力・IP入力・追加ボタン
+ */
+function renderTargets() {
+  const el = document.getElementById("target-blocks");
+  el.innerHTML = "";
+  Object.entries(state.targets).forEach(([sid, sla]) => {
+    const div = document.createElement("div");
+    div.className = "ip-block";
+
+    // 種別バッジ: HTTP は青・ping はグレーで視覚的に区別
+    const typeTag = sla.type === "http"
+      ? '<span class="badge badge-info" style="font-size:11px">HTTP</span>'
+      : '<span class="badge badge-gray" style="font-size:11px">ping</span>';
+
+    // チームごとの IP 入力行を生成（state.teams の順番に対応）
+    const rows = state.teams.map((t, ti) => `
+      <div class="ip-entry">
+        <span class="ip-team-lbl">${t.id}</span>
+        <!-- onchange で state.targets の ips を即時更新 -->
+        <input
+          style="font-family:var(--mono);font-size:12px;padding:3px 7px;height:28px;"
+          value="${sla.ips[ti] || ""}"
+          onchange="state.targets['${sid}'].ips[${ti}]=this.value"
+          placeholder="IPアドレス">
+        <button class="btn btn-danger btn-sm" onclick="removeIpEntry('${sid}',${ti})">✕</button>
+      </div>`).join("");
+
+    div.innerHTML = `
+      <div class="ip-block-head">
+        <span class="ip-block-title">${sid.toUpperCase()}</span>
+        ${typeTag}
+        <span style="flex:1;font-size:12px;color:var(--text2);margin-left:8px;">${sla.desc || ""}</span>
+        <button class="btn btn-danger btn-sm" onclick="deleteSla('${sid}')">SLA削除</button>
+      </div>
+      <div class="ip-block-body">
+        <div id="entries-${sid}">${rows}</div>
+        <!-- エントリ追加フォーム: チーム名省略時は自動採番、指定時は既存チームを上書き -->
+        <div class="ip-add">
+          <input style="font-family:var(--mono);font-size:12px;padding:3px 7px;height:28px;"
+                 id="add-lbl-${sid}" placeholder="チーム名(省略可)">
+          <input style="font-family:var(--mono);font-size:12px;padding:3px 7px;height:28px;"
+                 id="add-ip-${sid}" placeholder="IPアドレス">
+          <button class="btn btn-primary btn-sm" onclick="addIpEntry('${sid}')">＋ 追加</button>
+        </div>
+      </div>`;
+    el.appendChild(div);
+  });
+
+  if (!Object.keys(state.targets).length) {
+    el.innerHTML = '<div style="text-align:center;padding:24px;color:var(--text2)">SLA項目がありません。「SLA項目追加」から追加してください。</div>';
+  }
+}
+
+/**
+ * 指定 SLA のエントリ追加フォームからIPアドレスを追加する。
+ *
+ * @param {string} sid - 対象の SLA ID (例: "sla01")
+ *
+ * チーム名ラベルの扱い:
+ *   - 指定あり・既存チーム: そのチームの IP を上書き
+ *   - 指定あり・新規チーム: state.teams に追加し、他 SLA に "0.0.0.0" を追加
+ *   - 指定なし: IP をリストに追加し、チームが不足していれば自動採番で追加
+ */
+function addIpEntry(sid) {
+  const lbl = document.getElementById("add-lbl-" + sid).value.trim();
+  const ip  = document.getElementById("add-ip-"  + sid).value.trim();
+  if (!ip) { toast("IPアドレスを入力してください", "err"); return; }
+
+  const sla = state.targets[sid];
+
+  if (lbl) {
+    // チーム名が入力された場合
+    const ti = state.teams.findIndex(t => t.id === lbl);
+    if (ti >= 0) {
+      // 既存チームの IP を上書き
+      sla.ips[ti] = ip;
+    } else {
+      // 新規チームを追加
+      state.teams.push({ id: lbl, name: lbl, enabled: true });
+      // 他のSLA ターゲットにプレースホルダー IP を追加（整合性維持）
+      Object.values(state.targets).forEach(s => { if (s !== sla) s.ips.push("0.0.0.0"); });
+      sla.ips.push(ip);
+    }
+  } else {
+    // チーム名省略時: IP を追加し、チームが不足していれば自動採番で追加
+    sla.ips.push(ip);
+    if (sla.ips.length > state.teams.length) {
+      const id = "team" + String(state.teams.length + 1).padStart(2, "0");
+      state.teams.push({ id, name: id, enabled: true });
+      Object.values(state.targets).forEach(s => { if (s !== sla) s.ips.push("0.0.0.0"); });
+    }
+  }
+
+  // 入力欄をクリアして再描画
+  document.getElementById("add-lbl-" + sid).value = "";
+  document.getElementById("add-ip-"  + sid).value = "";
+  renderTargets();
+  syncTeamSelects();
+  toast("エントリを追加しました");
+}
+
+/**
+ * 指定 SLA・チームインデックスのエントリを削除する。
+ *
+ * @param {string} sid - 対象の SLA ID
+ * @param {number} ti  - 削除するチームのインデックス
+ *
+ * 副作用:
+ *   対応するチームを state.teams からも削除し、
+ *   他の全 SLA ターゲットの ips からも同インデックスを除去する（整合性維持）。
+ */
+function removeIpEntry(sid, ti) {
+  state.targets[sid].ips.splice(ti, 1);
+  state.teams.splice(ti, 1);
+  // 削除したSLA以外の全ターゲットからも同インデックスを除去
+  Object.values(state.targets).forEach(s => {
+    if (s !== state.targets[sid] && s.ips.length > ti) s.ips.splice(ti, 1);
+  });
+  renderTargets();
+  syncTeamSelects();
+}
+
+/**
+ * 指定 SLA 項目を state.targets から削除して再描画する。
+ *
+ * @param {string} sid - 削除する SLA ID
+ *
+ * 備考:
+ *   state から削除するだけで、保存ボタン（saveTargets）を押すまでサーバーには反映されない。
+ */
+function deleteSla(sid) {
+  if (!confirm(`${sid.toUpperCase()} を削除しますか？`)) return;
+  delete state.targets[sid];
+  renderTargets();
+  toast(`${sid.toUpperCase()} を削除しました`);
+}
+
+/**
+ * state.targets を /api/targets に POST して永続化する。
+ * サーバー側で config/targets.json の保存と param.py の再生成が行われる。
+ */
+async function saveTargets() {
+  const res = await api("/api/targets", "POST", state.targets);
+  toast(res.message || "保存しました", res.ok ? "ok" : "err");
+}
+
+/** SLA項目追加モーダルを表示する */
+function openAddSlaModal()  { document.getElementById("add-sla-modal").classList.add("open"); }
+
+/** SLA項目追加モーダルを閉じる */
+function closeAddSlaModal() { document.getElementById("add-sla-modal").classList.remove("open"); }
+
+/**
+ * SLA項目追加モーダルの「追加」ボタン処理。
+ *
+ * バリデーション:
+ *   - SLA ID が空: エラートーストを表示して中断
+ *   - SLA ID が既存と重複: エラートーストを表示して中断
+ *
+ * 処理:
+ *   state.targets に新しい SLA 項目を追加し、
+ *   全チームのデフォルト IP（入力値または "0.0.0.0"）で ips 配列を初期化する。
+ *   モーダルを閉じて renderTargets() で再描画する。
+ */
+function confirmAddSla() {
+  const id    = document.getElementById("new-sla-id").value.trim().toLowerCase();
+  const type  = document.getElementById("new-sla-type").value;
+  const desc  = document.getElementById("new-sla-desc").value.trim();
+  const defIp = document.getElementById("new-sla-ip").value.trim() || "0.0.0.0";
+
+  if (!id) { toast("SLA IDを入力してください", "err"); return; }
+  if (state.targets[id]) { toast(`${id} は既に存在します`, "err"); return; }
+
+  // 全チーム分の IP リストをデフォルト IP で初期化
+  state.targets[id] = { type, desc, ips: state.teams.map(() => defIp) };
+
+  closeAddSlaModal();
+  renderTargets();
+  toast(`${id.toUpperCase()} を追加しました`);
+
+  // フォーム入力欄をリセット
+  ["new-sla-id","new-sla-desc","new-sla-ip"].forEach(i => document.getElementById(i).value = "");
+}
+
+
+// ══════════════════════════════
+// スケジュールパネル
+// ══════════════════════════════
+
+/**
+ * /api/schedule からスケジュール設定を取得してフォームに反映する。
+ */
+async function loadSchedule() {
+  state.schedule = await api("/api/schedule");
+  document.getElementById("cron-min").value     = state.schedule.cron_min    || "*/5";
+  document.getElementById("cron-hour").value    = state.schedule.cron_hour   || "*";
+  document.getElementById("cron-rest").value    = state.schedule.cron_rest   || "* * *";
+  document.getElementById("http-timeout").value = state.schedule.http_timeout || 7.0;
+  document.getElementById("script-path").value  = state.schedule.script_path  || "/home/user/check-sla.sh";
+  updateCronPre(); // フォーム反映後にプレビューを更新
+}
+
+/**
+ * cron フィールドの入力値から説明文と crontab エントリプレビューをリアルタイム更新する。
+ *
+ * 説明文の生成ルール:
+ *   - "*/N" 形式 → "N分ごとに..." と表示
+ *   - 分=0 時=* → "毎時0分に..." と表示
+ *   - 分=0 時=0 → "毎日0時に..." と表示
+ *   - その他 → cron 式をそのまま表示
+ */
+function updateCronPre() {
+  const m = document.getElementById("cron-min").value;
+  const h = document.getElementById("cron-hour").value;
+  const r = document.getElementById("cron-rest").value;
+  const expr = `${m} ${h} ${r}`;
+
+  let desc = `${expr} で実行`;
+  if (m.startsWith("*/")) desc = `${m.slice(2)}分ごとに全チームで実行`;
+  if (m === "0" && h === "*") desc = "毎時0分に全チームで実行";
+  if (m === "0" && h === "0") desc = "毎日0時に全チームで実行";
+  document.getElementById("cron-desc").textContent = desc;
+
+  // crontab エントリプレビュー: チームごとに1行生成
+  const sp = document.getElementById("script-path")?.value || "/home/user/check-sla.sh";
+  document.getElementById("cron-out").textContent =
+    state.teams.map(t => `${expr} ${sp} ${t.id}  # SLA-MANAGED`).join("\n");
+}
+
+/**
+ * クイック設定ボタンから cron フィールドを一括設定してプレビューを更新する。
+ *
+ * @param {string} m - 分フィールド
+ * @param {string} h - 時フィールド
+ * @param {string} r - 日/月/曜日フィールド
+ */
+function setCron(m, h, r) {
+  document.getElementById("cron-min").value  = m;
+  document.getElementById("cron-hour").value = h;
+  document.getElementById("cron-rest").value = r;
+  updateCronPre();
+}
+
+/**
+ * フォームの入力値を /api/schedule に POST して永続化する。
+ * サーバー側で config/schedule.json の保存・crontab 更新・param.py 再生成が行われる。
+ */
+async function saveSchedule() {
+  const body = {
+    cron_min:     document.getElementById("cron-min").value,
+    cron_hour:    document.getElementById("cron-hour").value,
+    cron_rest:    document.getElementById("cron-rest").value,
+    http_timeout: parseFloat(document.getElementById("http-timeout").value),
+    script_path:  document.getElementById("script-path").value,
+  };
+  const res = await api("/api/schedule", "POST", body);
+  toast(res.message || "保存しました", res.ok ? "ok" : "err");
+}
+
+/**
+ * crontab プレビューをクリップボードにコピーする。
+ * crontab コマンドが使えないサーバーで手動貼り付けする場合に使用。
+ */
+function copyCron() {
+  navigator.clipboard?.writeText(document.getElementById("cron-out").textContent);
+  toast("crontabをコピーしました");
+}
+
+
+// ══════════════════════════════
+// データベースパネル
+// ══════════════════════════════
+
+/**
+ * /api/database から DB 接続設定を取得してフォームに反映する。
+ * パスワードはセキュリティ上 API から返されないため入力欄は空のまま。
+ */
+async function loadDb() {
+  state.db = await api("/api/database");
+  document.getElementById("db-host").value = state.db.host     || "localhost";
+  document.getElementById("db-port").value = state.db.port     || "8086";
+  document.getElementById("db-user").value = state.db.username || "user";
+  document.getElementById("db-name").value = state.db.name     || "bc_db";
+  syncTeamSelects(); // リセット対象チームセレクトを同期
+}
+
+/**
+ * /api/database/test に POST して実際の InfluxDB 接続を確認する。
+ * 結果を #db-test-result に色付きで表示する（スピナーで通信中を表現）。
+ */
+async function testDb() {
+  const el = document.getElementById("db-test-result");
+  el.innerHTML = '<span class="spin"></span> 接続中...';
+  const res = await api("/api/database/test", "POST");
+  el.innerHTML = res.ok
+    ? `<span style="color:var(--ok)">✓ ${res.message}</span>`
+    : `<span style="color:var(--err)">✗ ${res.message}</span>`;
+}
+
+/**
+ * フォームの入力値を /api/database に POST して永続化する。
+ * パスワード欄が空の場合はサーバー側で既存パスワードを維持する。
+ */
+async function saveDb() {
+  const body = {
+    host:     document.getElementById("db-host").value,
+    port:     document.getElementById("db-port").value,
+    username: document.getElementById("db-user").value,
+    password: document.getElementById("db-pass").value, // 空の場合はサーバー側で維持
+    name:     document.getElementById("db-name").value,
+  };
+  const res = await api("/api/database", "POST", body);
+  toast(res.message || "保存しました", res.ok ? "ok" : "err");
+}
+
+/**
+ * /api/database/measurements から Measurement 一覧を取得してテーブルに描画する。
+ * スピナーで通信中を示し、取得完了後に一覧を表示する。
+ */
+async function loadMeasurements() {
+  const tbody = document.getElementById("meas-tbody");
+  tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px;"><span class="spin"></span></td></tr>';
+
+  const data = await api("/api/database/measurements")
+    .catch(() => ({ error: "接続失敗" }));
+
+  if (data.error) {
+    tbody.innerHTML = `<tr><td colspan="4" style="color:var(--err);padding:12px;">${data.error}</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = "";
+  data.forEach(m => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td style="font-family:var(--mono);font-size:12px;">${m.name}</td>
+      <td>${m.rows.toLocaleString()} rows</td>
+      <td><span class="badge badge-ok">接続中</span></td>
+      <td>
+        <!-- resetTeamDirect(): テーブル行から直接そのチームを初期化 -->
+        <button class="btn btn-danger btn-sm" onclick="resetTeamDirect('${m.name}')">初期化</button>
+      </td>`;
+    tbody.appendChild(tr);
+  });
+
+  if (!data.length) {
+    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;padding:16px;color:var(--text2)">データなし</td></tr>';
+  }
+}
+
+/**
+ * Measurement 一覧テーブルの「初期化」ボタンから直接チームデータを削除する。
+ *
+ * @param {string} name - 削除する Measurement 名（= チームID）
+ */
+async function resetTeamDirect(name) {
+  if (!confirm(`${name} のデータを削除しますか？`)) return;
+  const res = await api(`/api/database/reset/${name}`, "DELETE");
+  toast(res.message, res.ok ? "ok" : "err");
+  loadMeasurements(); // 削除後に一覧を更新
+}
+
+/**
+ * セレクトボックスで選択したチームのデータを InfluxDB から削除する。
+ * drop_measurement を使用するため、削除したデータは復元不可。
+ */
+async function resetTeam() {
+  const t = document.getElementById("reset-team").value;
+  if (!t) { toast("チームを選択してください", "err"); return; }
+  if (!confirm(`${t} のデータを全て削除しますか？`)) return;
+  const res = await api(`/api/database/reset/${t}`, "DELETE");
+  toast(res.message, res.ok ? "ok" : "err");
+}
+
+/**
+ * データベース全体を初期化する（drop_database → create_database）。
+ * 全チームの全記録が消える重大な操作のため、confirm を 2 回表示する。
+ */
+async function resetAll() {
+  if (!confirm("全チームのデータを削除します。本当によろしいですか？")) return;
+  if (!confirm("この操作は元に戻せません。最終確認: 実行しますか？")) return;
+  const res = await api("/api/database/reset-all", "DELETE");
+  toast(res.message, res.ok ? "ok" : "err");
+}
+
+
+// ══════════════════════════════
+// ログパネル
+// ══════════════════════════════
+
+/**
+ * /api/logs からログ行を取得してリストに描画する。
+ *
+ * チームセレクトで絞り込み可能（空 = 全チーム）。
+ * ログ行をログレベル（ok/warn/err）ごとに色分けして表示する。
+ *
+ * ログレベルの判定:
+ *   テキストに "error" / "失敗" / "Error" が含まれる → err（赤）
+ *   テキストに "warn"  / "異常" が含まれる          → warn（オレンジ）
+ *   その他                                          → ok（緑）
+ */
+async function loadLogs() {
+  const team = document.getElementById("log-team-sel")?.value || "";
+  const data = await api(`/api/logs?team=${team}`);
+  const el = document.getElementById("log-list");
+  el.innerHTML = "";
+
+  if (!data.length) {
+    el.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text2);">ログなし</div>';
+    return;
+  }
+
+  // API から返る配列は古い順のため、reverse() で新しい順に表示
+  [...data].reverse().forEach(l => {
+    const d = document.createElement("div");
+    d.className = "log-line";
+
+    // テキスト内容でログレベルを判定
+    const level = l.text.includes("error") || l.text.includes("失敗") || l.text.includes("Error") ? "err"
+                : l.text.includes("warn")  || l.text.includes("異常")                             ? "warn"
+                : "ok";
+
+    d.innerHTML = `<span class="log-time">${l.time} ${l.team}</span><span class="log-${level}">${l.text}</span>`;
+    el.appendChild(d);
+  });
+}
+
+
+// ══════════════════════════════
+// 共通ユーティリティ
+// ══════════════════════════════
+
+/**
+ * state.teams の変化に合わせてセレクトボックスを同期する。
+ *
+ * 対象要素:
+ *   #reset-team    : DB パネルの初期化対象チーム選択
+ *   #log-team-sel  : ログパネルのチーム絞り込み
+ *
+ * 処理:
+ *   - 現在の選択値 (cur) を保存
+ *   - innerHTML を全て書き換えてオプションを再生成
+ *   - 元の選択値を復元（存在しない場合はデフォルトに戻る）
+ */
+function syncTeamSelects() {
+  ["reset-team", "log-team-sel"].forEach(id => {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const cur = sel.value; // 現在の選択値を退避
+    const def = id === "log-team-sel"
+      ? '<option value="">全チーム</option>'
+      : '<option value="">— 選択 —</option>';
+    sel.innerHTML = def + state.teams.map(t => `<option value="${t.id}">${t.id}</option>`).join("");
+    sel.value = cur; // 選択値を復元
+  });
+}
+
+
+// ══════════════════════════════
+// 初期化
+// ══════════════════════════════
+
+/**
+ * ページロード時の初期化処理。
+ *
+ * 処理:
+ *   1. teams / targets / schedule を並行して取得（Promise.all で高速化）
+ *   2. サイドバーの API 接続状態インジケータを更新
+ *   3. セレクトボックスを同期
+ *   4. crontab プレビューを更新（schedule 取得後に正しい内容が表示されるよう）
+ *
+ * エラー時:
+ *   API に接続できない場合はインジケータを「API未接続」（赤）に変更。
+ *   ページ自体は表示され、保存操作時にエラーが発生する。
+ */
+async function init() {
+  try {
+    // 3つのAPIを並行取得してページ表示を高速化
+    [state.teams, state.targets, state.schedule] = await Promise.all([
+      api("/api/teams"),
+      api("/api/targets"),
+      api("/api/schedule"),
+    ]);
+    document.getElementById("api-status").textContent = "● API接続中";
+    document.getElementById("api-status").style.color = "var(--ok)";
+    syncTeamSelects();
+    updateCronPre(); // スケジュール設定を反映したプレビューを表示
+  } catch(e) {
+    // Flask サーバーが起動していない場合など
+    document.getElementById("api-status").textContent = "● API未接続";
+    document.getElementById("api-status").style.color = "var(--err)";
+  }
+}
+
+// ページロード時に初期化を実行
+init();
+</script>
+</body>
+</html>
+
   --border: rgba(0,0,0,0.10);
   --border2: rgba(0,0,0,0.18);
   --text: #1a1a18;
