@@ -291,32 +291,6 @@ sudo systemctl start sla-console
 
 ---
 
-## .gitignore の推奨設定
-
-機密情報（DBパスワード等）や自動生成ファイルを除外するため、  
-以下の `.gitignore` を用意することを推奨します。
-
-```gitignore
-# 設定ファイル（DBパスワードを含むため除外）
-config/
-
-# param.py は自動生成されるため除外
-param.py
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
-
-# ログ
-*.log
-```
-
-> **注意:** `config/database.json` には InfluxDB のパスワードが平文で保存されます。  
-> `config/` ディレクトリは必ず `.gitignore` に追加してください。
-
----
-
 ## ライセンス
 
 MIT License
