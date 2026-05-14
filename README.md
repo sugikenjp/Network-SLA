@@ -1,4 +1,3 @@
-[README.md](https://github.com/user-attachments/files/27764495/README.md)
 # SLA監視管理コンソール
 
 SLA疎通チェックスクリプト（`sla.py` / `check-sla.sh`）の設定・実行・スコア管理を  
