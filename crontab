@@ -1,0 +1,4 @@
+# /etc/cron.d/sla-check
+# SLA疎通チェック 定期実行スケジュール
+# 実行間隔を変更する場合は docker-compose.yml の CRON_SCHEDULE 環境変数を使用する
+*/5 * * * * root /app/check-sla.sh >> /var/log/sla/cron.log 2>&1
