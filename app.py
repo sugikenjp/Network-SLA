@@ -52,6 +52,10 @@ PARAM_FILE = BASE_DIR / "param.py"
 # ローカル実行の場合: app.py と同じディレクトリの log/
 LOG_DIR = Path(os.environ.get("LOG_DIR", str(BASE_DIR / "log")))
 
+# コンテナ内の cron 設定ファイルパス
+# Docker版では /etc/cron.d/sla-check に配置している
+CRON_FILE = Path("/etc/cron.d/sla-check")
+
 CONFIG_DIR.mkdir(exist_ok=True)
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -250,20 +254,24 @@ def get_schedule():
 @app.route("/api/schedule", methods=["POST"])
 def save_schedule():
     """
-    スケジュール設定を保存する。
-    cron_schedule の変更は docker-compose.yml の CRON_SCHEDULE と手動で同期すること。
-    http_timeout の変更は param.py 再生成に反映される。
+    スケジュール設定を保存し、cron と param.py に即時反映する。
+
+    処理:
+        1. config/schedule.json に保存
+        2. /etc/cron.d/sla-check を書き換えて cron に即時反映
+        3. param.py を再生成（http_timeout の変更を反映）
+
+    備考:
+        cron デーモンは /etc/cron.d/ の変更を自動検知するため
+        コンテナの再起動は不要。
     """
     data = request.get_json()
     _save_cfg("schedule", data)
+    cron_result = _apply_crontab(data)
     _apply_param_py()
     return jsonify({
         "ok": True,
-        "message": (
-            "スケジュール設定を保存しました。\n"
-            "実行間隔を変更した場合は docker-compose.yml の "
-            "CRON_SCHEDULE も同じ値に変更してコンテナを再起動してください。"
-        )
+        "message": cron_result,
     })
 
 
@@ -448,6 +456,85 @@ def export_param_py():
         mimetype="text/plain",
         headers={"Content-Disposition": "attachment; filename=param.py"},
     )
+
+
+# ─────────────────────────── 内部処理: crontab 即時更新 ───────────────────────────
+
+def _apply_crontab(schedule: dict) -> str:
+    """
+    /etc/cron.d/sla-check の実行間隔を書き換えて cron に即時反映する。
+
+    cron デーモン（vixie-cron / cronie）は /etc/cron.d/ ファイルの変更を
+    自動検知して再読み込みするため、コンテナの再起動は不要。
+
+    引数:
+        schedule : スケジュール設定 {"cron_schedule": "*/5 * * * *", ...}
+
+    戻り値:
+        結果メッセージ文字列（API レスポンスの message に使用）
+
+    処理フロー:
+        1. CRON_FILE が存在するか確認（Docker環境かどうかの判定）
+        2. 現在のファイル内容を読み込む
+        3. cron 式の行（# SLA-CHECK タグ付き）を新しい間隔で置き換える
+        4. ファイルに書き戻す
+    """
+    cron_expr = schedule.get("cron_schedule", "*/5 * * * *").strip()
+    team      = _cfg("team", _default_team())
+    team_id   = team["id"]
+    script    = schedule.get("script_path", "/app/check-sla.sh")
+
+    # Docker環境以外（ローカルの start.sh 起動）では CRON_FILE が存在しない
+    if not CRON_FILE.exists():
+        return (
+            f"スケジュール設定を保存しました（http_timeout を param.py に反映）。\n"
+            f"cron の間隔変更はローカル環境のため手動で crontab を設定してください。"
+        )
+
+    try:
+        # 新しい cron エントリを生成
+        # 例: */10 * * * * root /app/check-sla.sh team01
+        new_line = f"{cron_expr} root {script} {team_id}\n"
+
+        # 既存ファイルの cron エントリ行を置き換える
+        # コメント行と空行はそのまま保持し、実行行だけ更新する
+        existing = CRON_FILE.read_text()
+        new_lines = []
+        replaced = False
+        for line in existing.splitlines(keepends=True):
+            # コメント行・空行はそのまま保持
+            stripped = line.strip()
+            if stripped.startswith("#") or stripped == "":
+                new_lines.append(line)
+            else:
+                # 最初の実行行を新しい内容に置き換える
+                if not replaced:
+                    new_lines.append(new_line)
+                    replaced = True
+                # 2行目以降の実行行は削除（1エントリのみ管理）
+
+        # 実行行が存在しなかった場合は末尾に追加
+        if not replaced:
+            new_lines.append(new_line)
+
+        CRON_FILE.write_text("".join(new_lines))
+        app.logger.info(f"crontab 更新: {new_line.strip()}")
+        return (
+            f"スケジュールを保存しました。\n"
+            f"cron を「{cron_expr}」に更新しました（再起動不要）。"
+        )
+
+    except PermissionError:
+        # 権限エラー（Docker以外の環境で root 以外で実行した場合など）
+        app.logger.warning(f"crontab 書き換え権限なし: {CRON_FILE}")
+        return (
+            f"スケジュール設定を保存しました。\n"
+            f"cron ファイルへの書き込み権限がないため、間隔は変更されませんでした。\n"
+            f"docker compose restart で再起動してください。"
+        )
+    except Exception as e:
+        app.logger.error(f"crontab 更新エラー: {e}")
+        return f"設定を保存しましたが、cron の更新に失敗しました: {e}"
 
 
 # ─────────────────────────── 内部処理: param.py 書き出し ───────────────────────────
