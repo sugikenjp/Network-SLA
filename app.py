@@ -385,32 +385,90 @@ def reset_all():
 
 # ─────────────────────────── API: SLA 手動実行 ───────────────────────────
 
+def _parse_sla_results(stdout: str) -> dict:
+    """
+    sla.py の stdout から RESULT: 行をパースして個別チェック結果を返す。
+
+    sla.py が出力する形式:
+        RESULT:ping:sla01:OK:1.1.1.1
+        RESULT:ping:sla02:NG:1.1.2.2
+        RESULT:http:sla06:OK:192.168.1.1
+        RESULT:db:write:OK
+        RESULT:log:write:OK
+
+    戻り値:
+        {
+          "ping": {"sla01": {"ok": True,  "ip": "1.1.1.1"},
+                   "sla02": {"ok": False, "ip": "1.1.2.2"}, ...},
+          "http": {"sla06": {"ok": True,  "ip": "192.168.1.1"}},
+          "db":   {"write": {"ok": True}},
+          "log":  {"write": {"ok": True}},
+        }
+    """
+    parsed = {"ping": {}, "http": {}, "db": {}, "log": {}}
+    for line in stdout.splitlines():
+        if not line.startswith("RESULT:"):
+            continue
+        parts = line.split(":")
+        # RESULT:ping:sla01:OK:1.1.1.1  → 5要素
+        # RESULT:db:write:OK             → 4要素
+        if len(parts) < 4:
+            continue
+        kind   = parts[1]  # ping / http / db / log
+        target = parts[2]  # sla01〜06 / write
+        status = parts[3]  # OK / NG
+        ip     = parts[4] if len(parts) > 4 else ""
+        ok     = (status == "OK")
+        if kind in parsed:
+            parsed[kind][target] = {"ok": ok, "ip": ip}
+    return parsed
+
+
 @app.route("/api/run-check", methods=["POST"])
 def run_check():
     """
     check-sla.sh をこのコンテナの担当チームで手動実行する。
-    マルチチーム版の複数チームループを廃止し、1チームのみ実行する。
+
+    レスポンス (JSON):
+        {
+          "ok": true,
+          "results": [{
+            "team": "team01",
+            "ok": true,
+            "details": {
+              "ping": {"sla01": {"ok": true,  "ip": "1.1.1.1"},
+                       "sla02": {"ok": false, "ip": "1.1.2.2"}, ...},
+              "http": {"sla06": {"ok": true,  "ip": "192.168.1.1"}},
+              "db":   {"write": {"ok": true}},
+              "log":  {"write": {"ok": true}}
+            },
+            "stdout": "...",
+            "stderr": "..."
+          }]
+        }
     """
-    team   = _cfg("team",     _default_team())
-    sched  = _cfg("schedule", _default_schedule())
+    team    = _cfg("team",     _default_team())
+    sched   = _cfg("schedule", _default_schedule())
     script  = sched.get("script_path", str(BASE_DIR / "check-sla.sh"))
     team_id = team["id"]
 
     try:
         proc = subprocess.run(
             ["bash", script, team_id],
-            capture_output=True, text=True, timeout=30,
+            capture_output=True, text=True, timeout=60,
         )
+        details = _parse_sla_results(proc.stdout)
         result = {
-            "team":   team_id,
-            "ok":     proc.returncode == 0,
-            "stdout": proc.stdout[-500:],
-            "stderr": proc.stderr[-200:],
+            "team":    team_id,
+            "ok":      proc.returncode == 0,
+            "details": details,
+            "stdout":  proc.stdout[-1000:],
+            "stderr":  proc.stderr[-300:],
         }
     except subprocess.TimeoutExpired:
-        result = {"team": team_id, "ok": False, "stdout": "", "stderr": "timeout"}
+        result = {"team": team_id, "ok": False, "details": {}, "stdout": "", "stderr": "timeout"}
     except FileNotFoundError:
-        result = {"team": team_id, "ok": False, "stdout": "",
+        result = {"team": team_id, "ok": False, "details": {}, "stdout": "",
                   "stderr": f"スクリプトが見つかりません: {script}"}
 
     return jsonify({"ok": True, "results": [result]})
