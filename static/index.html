@@ -219,7 +219,7 @@ input:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 
       <div id="panel-schedule" class="panel">
         <div class="card">
           <div class="card-head"><span class="card-title">cron 実行間隔</span><span class="badge badge-info">docker-compose.yml</span></div>
-          <div class="warn-bar">Docker版では cron の実行間隔は <code>docker-compose.yml</code> の <code>CRON_SCHEDULE</code> 環境変数で管理します。変更後はコンテナを再起動してください（<code>docker compose restart</code>）。</div>
+          <div class="info-bar">「設定を保存」するとコンテナ内の cron に即時反映されます（再起動不要）。</div>
           <div style="margin-bottom:10px;"><label>cron スケジュール（現在の設定値）</label><input id="cron-schedule" value="*/5 * * * *"></div>
           <div style="font-size:12px;color:var(--text2);margin-bottom:8px;">クイック設定</div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
