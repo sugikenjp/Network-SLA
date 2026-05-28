@@ -123,7 +123,29 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. 起動
+### 3. ファイル構成の確認
+
+起動前に `static/index.html` が正しい場所にあることを確認してください。
+
+```
+sla-console/
+├── app.py
+├── static/
+│   └── index.html   ← ここに必要（直下ではなく static/ の中）
+└── ...
+```
+
+`index.html` が `app.py` と同じ階層に置かれている場合は移動してください：
+
+```bash
+mkdir -p static
+mv index.html static/index.html
+```
+
+> **注意:** `index.html` を `static/` の外に置くと Flask が見つけられず、  
+> ブラウザで `404 Not Found` が表示されます。
+
+### 4. 起動
 
 ```bash
 # 起動スクリプトを使う場合（推奨）
@@ -136,7 +158,7 @@ python3 app.py
 PORT=8080 python3 app.py
 ```
 
-### 4. ブラウザでアクセス
+### 5. ブラウザでアクセス
 
 ```
 http://localhost:5000
@@ -288,6 +310,32 @@ sudo systemctl daemon-reload
 sudo systemctl enable sla-console
 sudo systemctl start sla-console
 ```
+
+---
+
+## .gitignore の推奨設定
+
+機密情報（DBパスワード等）や自動生成ファイルを除外するため、  
+以下の `.gitignore` を用意することを推奨します。
+
+```gitignore
+# 設定ファイル（DBパスワードを含むため除外）
+config/
+
+# param.py は自動生成されるため除外
+param.py
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# ログ
+*.log
+```
+
+> **注意:** `config/database.json` には InfluxDB のパスワードが平文で保存されます。  
+> `config/` ディレクトリは必ず `.gitignore` に追加してください。
 
 ---
 
