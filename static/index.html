@@ -337,28 +337,87 @@ function switchTab(name) {
 
 // ── 状態確認 ──
 async function runCheck() {
-  toast("SLAチェック実行中...", "ok", 8000);
+  toast("SLAチェック実行中...", "ok", 10000);
   const btn = document.querySelector('[onclick="runCheck()"]');
   btn.disabled = true;
+  document.getElementById("status-tbody").innerHTML =
+    '<tr><td colspan="10" style="text-align:center;padding:16px;color:var(--text2)"><span class="spin"></span> チェック中...</td></tr>';
   const data = await api("/api/run-check", "POST", {}).catch(() => ({ ok: false, results: [] }));
   btn.disabled = false;
   document.getElementById("last-run").textContent = "最終チェック: " + new Date().toLocaleTimeString("ja-JP");
   renderCheckResult(data.results?.[0]);
-  toast(data.ok ? "チェック完了" : "チェックエラー", data.ok ? "ok" : "err");
+  const r = data.results?.[0];
+  const allOk = r?.ok;
+  toast(allOk ? "チェック完了 — 全項目正常" : "チェック完了 — 異常あり", allOk ? "ok" : "err");
 }
 
 function renderCheckResult(result) {
-  const slaKeys = Object.keys(state.targets);
-  document.getElementById("status-thead").innerHTML =
-    `<tr><th>チーム</th>${slaKeys.map(k=>`<th>${k}</th>`).join("")}<th>状態</th></tr>`;
-  const tbody = document.getElementById("status-tbody");
   document.getElementById("s-team").textContent = state.team.id || "—";
-  document.getElementById("s-slas").textContent = slaKeys.length;
-  if (!result) { document.getElementById("s-ok").textContent = "—"; document.getElementById("s-err").textContent = "—"; return; }
-  document.getElementById("s-ok").textContent  = result.ok ? "1" : "0";
-  document.getElementById("s-err").textContent = result.ok ? "0" : "1";
-  const pips = slaKeys.map(k => `<td><span class="pip ${result.ok?'pip-ok':'pip-err'}">${result.ok?'✓':'✗'}</span></td>`).join("");
-  tbody.innerHTML = `<tr><td style="font-weight:500">${result.team}</td>${pips}<td>${result.ok?'<span class="badge badge-ok">正常</span>':'<span class="badge badge-err">異常あり</span>'}</td></tr>`;
+
+  if (!result) {
+    document.getElementById("s-slas").textContent = "—";
+    document.getElementById("s-ok").textContent  = "—";
+    document.getElementById("s-err").textContent = "—";
+    return;
+  }
+
+  const d = result.details || {};
+  const ping = d.ping || {};
+  const http = d.http || {};
+  const db   = d.db   || {};
+  const log  = d.log  || {};
+
+  // ── サマリー集計 ──
+  const slaKeys  = Object.keys(state.targets);
+  const pingKeys = Object.keys(ping);
+  const httpKeys = Object.keys(http);
+  const allItems = [...pingKeys.map(k=>ping[k]), ...httpKeys.map(k=>http[k]),
+                    ...(db.write ? [db.write] : []), ...(log.write ? [log.write] : [])];
+  const okCount  = allItems.filter(v=>v.ok).length;
+  const ngCount  = allItems.filter(v=>!v.ok).length;
+  document.getElementById("s-slas").textContent = allItems.length || slaKeys.length;
+  document.getElementById("s-ok").textContent   = okCount;
+  document.getElementById("s-err").textContent  = ngCount;
+
+  // ── テーブルヘッダ ──
+  const thead = document.getElementById("status-thead");
+  thead.innerHTML = `<tr>
+    <th style="width:80px">チーム</th>
+    ${pingKeys.map(k=>`<th>${k.toUpperCase()}<br><small style="font-weight:normal;color:var(--text2)">${ping[k]?.ip||""}</small></th>`).join("")}
+    ${httpKeys.map(k=>`<th>${k.toUpperCase()}<br><small style="font-weight:normal;color:var(--text2)">${http[k]?.ip||""}</small></th>`).join("")}
+    <th>DB書込</th>
+    <th>ログ</th>
+    <th style="width:80px">状態</th>
+  </tr>`;
+
+  // ── テーブル行 ──
+  const pip = (ok) => `<span class="pip ${ok?'pip-ok':'pip-err'}">${ok?'✓':'✗'}</span>`;
+  const tbody = document.getElementById("status-tbody");
+  const overall = result.ok;
+  tbody.innerHTML = `<tr>
+    <td style="font-weight:500">${result.team}</td>
+    ${pingKeys.map(k=>`<td style="text-align:center">${pip(ping[k]?.ok)}</td>`).join("")}
+    ${httpKeys.map(k=>`<td style="text-align:center">${pip(http[k]?.ok)}</td>`).join("")}
+    <td style="text-align:center">${db.write ? pip(db.write.ok) : '<span class="pip pip-na">—</span>'}</td>
+    <td style="text-align:center">${log.write ? pip(log.write.ok) : '<span class="pip pip-na">—</span>'}</td>
+    <td>${overall
+      ? '<span class="badge badge-ok">正常</span>'
+      : '<span class="badge badge-err">異常あり</span>'}</td>
+  </tr>`;
+
+  // ── 詳細エラー表示 ──
+  const errors = [];
+  pingKeys.forEach(k => { if(!ping[k]?.ok) errors.push(`${k.toUpperCase()} ping NG (${ping[k]?.ip})`); });
+  httpKeys.forEach(k => { if(!http[k]?.ok) errors.push(`${k.toUpperCase()} HTTP NG (${http[k]?.ip})`); });
+  if(db.write && !db.write.ok)   errors.push("DB書き込み NG");
+  if(log.write && !log.write.ok) errors.push("ログ書き込み NG");
+  if(errors.length > 0) {
+    const errDiv = document.createElement("div");
+    errDiv.className = "warn-bar";
+    errDiv.style.marginTop = "8px";
+    errDiv.textContent = "異常: " + errors.join(" / ");
+    document.getElementById("status-tbody").closest(".tbl-wrap").after(errDiv);
+  }
 }
 
 // ── チーム設定 ──
